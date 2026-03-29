@@ -1,0 +1,1380 @@
+# CUDA Graphs in LLM Inference Systems
+
+A comprehensive comparison of CUDA graph implementations in vLLM, SGLang, and TensorRT-LLM.
+
+---
+
+## Table of Contents
+1. [CUDA Graphs Overview](#1-cuda-graphs-overview)
+2. [vLLM CUDA Graphs](#2-vllm-cuda-graphs)
+3. [SGLang CUDA Graphs](#3-sglang-cuda-graphs)
+4. [TensorRT-LLM CUDA Graphs](#4-tensorrt-llm-cuda-graphs)
+5. [Algorithmic Differences](#5-algorithmic-differences)
+6. [Command-Line Options Comparison](#6-command-line-options-comparison)
+7. [Performance Trade-offs](#7-performance-trade-offs)
+8. [Best Practices](#8-best-practices)
+
+---
+
+## 1. CUDA Graphs Overview
+
+### What are CUDA Graphs?
+
+CUDA graphs capture a sequence of CUDA operations (kernels, memory copies) into a single executable unit that can be replayed multiple times with minimal CPU overhead.
+
+**Benefits:**
+- **Reduced CPU overhead**: Replaying a graph is much faster than launching individual kernels
+- **Better GPU utilization**: Less time waiting for CPU to issue commands
+- **Improved latency**: Faster time-to-first-token and per-token latency
+
+**Challenges:**
+- **Fixed input shapes**: Graphs require consistent tensor shapes
+- **Memory overhead**: Each graph consumes GPU memory
+- **Warmup cost**: Capturing graphs requires initial warmup runs
+
+**Key Concepts:**
+- **Capture**: Record a sequence of CUDA operations
+- **Replay**: Execute the recorded sequence
+- **Graph Pool**: Shared memory pool across multiple graphs
+- **Batch Padding**: Round batch sizes to match captured graphs
+
+---
+
+## 2. vLLM CUDA Graphs
+
+### 2.1 Architecture
+
+vLLM implements a **multi-mode CUDA graph system** with sophisticated dispatching:
+
+```
+CudagraphDispatcher
+    ├── NONE: Eager execution (no graphs)
+    ├── PIECEWISE: Per-layer graphs (attention excluded)
+    ├── FULL: Full model graph
+    ├── FULL_DECODE_ONLY: Full graphs for decode, eager for prefill
+    └── FULL_AND_PIECEWISE: Full for decode, piecewise for prefill (default)
+```
+
+### 2.2 Core Files
+
+**Location**: `/home/nmiriyal/Documents/UnderstandingVLLM/LatestVLLM/vllm/`
+
+```
+vllm/compilation/cuda_graph.py              - CUDAGraphWrapper (capture/replay)
+vllm/v1/cudagraph_dispatcher.py             - Mode selection logic
+vllm/config/compilation.py                  - CUDAGraphMode enum
+vllm/v1/worker/gpu_model_runner.py          - Warmup and capture
+vllm/engine/arg_utils.py                    - CLI arguments
+docs/design/cuda_graphs.md                  - Design documentation
+```
+
+### 2.3 CUDA Graph Modes
+
+**CUDAGraphMode Enum:**
+
+```python
+class CUDAGraphMode(enum.Enum):
+    NONE = 0                                  # No CUDA graphs
+    PIECEWISE = 1                             # Per-layer graphs
+    FULL = 2                                  # Full model graph
+    FULL_DECODE_ONLY = (FULL, NONE)          # Full for decode only
+    FULL_AND_PIECEWISE = (FULL, PIECEWISE)   # Hybrid (default)
+```
+
+**Mode Selection Algorithm:**
+
+1. **NONE**: Debugging, attention backends with no graph support
+2. **PIECEWISE**: Most flexible, excludes attention ops from graph
+3. **FULL**: Best performance for small models, requires uniform batches
+4. **FULL_DECODE_ONLY**: Decode-heavy workloads
+5. **FULL_AND_PIECEWISE**: Default - optimal for mixed workloads
+
+**Automatic Mode Downgrade:**
+
+Based on attention backend compatibility:
+- **FA3**: ALWAYS supported → Keep FULL
+- **FA2**: UNIFORM_BATCH → Downgrade FULL to FULL_AND_PIECEWISE
+- **FlashInfer**: UNIFORM_SINGLE_TOKEN_DECODE → Downgrade to FULL_DECODE_ONLY
+- **Cascade**: NEVER → Downgrade to PIECEWISE or NONE
+
+### 2.4 Capture and Replay
+
+**CUDAGraphWrapper** (compilation/cuda_graph.py):
+
+```python
+class CUDAGraphWrapper:
+    def __init__(self, runnable, mode):
+        self.runnable = runnable
+        self.mode = mode
+        self.cache = {}  # (batch_descriptor -> CUDAGraphEntry)
+
+    def __call__(self, *args, **kwargs):
+        # Get batch descriptor (key)
+        key = self._get_batch_descriptor(*args)
+
+        if key not in self.cache:
+            # CAPTURE: First time seeing this batch configuration
+            cudagraph = torch.cuda.CUDAGraph()
+
+            with torch.cuda.graph(cudagraph, pool=graph_pool):
+                output = self.runnable(*args, **kwargs)
+                output = weak_ref_tensors(output)  # Save memory
+
+            self.cache[key] = CUDAGraphEntry(
+                cudagraph=cudagraph,
+                output=output
+            )
+
+        # REPLAY: Existing batch configuration
+        self.cache[key].cudagraph.replay()
+        return self.cache[key].output
+```
+
+**Key Features:**
+
+1. **Weak Reference Outputs**: Saves memory by storing weak refs instead of real tensors
+2. **Offloader Synchronization**: Syncs prefetch streams before capture/replay
+3. **Graph Pool**: Uses global graph pool for memory efficiency
+4. **Input Validation**: In debug mode, checks tensor addresses match
+
+### 2.5 Batch Descriptor
+
+```python
+@dataclass(frozen=True)
+class BatchDescriptor:
+    num_tokens: int              # Padded token count
+    num_reqs: int | None         # Number of requests (None for PIECEWISE)
+    uniform: bool = False        # All requests same query length
+    has_lora: bool = False       # LoRA adapters active
+    num_active_loras: int = 0    # Count of active LoRAs
+```
+
+**Batch Matching Strategy:**
+- **FULL mode**: Exact match on (num_tokens, num_reqs, uniform, has_lora)
+- **PIECEWISE mode**: Relaxed match on (num_tokens, has_lora) only
+- Allows graph reuse across different request counts
+
+### 2.6 Warmup Procedure
+
+**Warmup Flow** (v1/worker/gpu_model_runner.py):
+
+```python
+def _warmup_and_capture(self, desc, cudagraph_runtime_mode):
+    # Phase 1: Warmup runs in NONE mode
+    for _ in range(num_warmups):  # Default: 0-2 warmups
+        self._dummy_run(
+            num_tokens=desc.num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,  # Eager
+            force_attention=True,  # Ensure attention kernels launch
+        )
+
+    # Phase 2: Capture run in target mode
+    self._dummy_run(
+        num_tokens=desc.num_tokens,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        is_graph_capturing=True,
+    )
+```
+
+**Capture Strategy:**
+- Captures in order: PIECEWISE graphs first (larger memory), then FULL graphs
+- Uses batch progress bar for visibility
+- Respects TP/PP rank for distributed coordination
+
+### 2.7 Command-Line Options
+
+```bash
+# CUDA graph mode
+--cudagraph-mode {NONE, PIECEWISE, FULL, FULL_DECODE_ONLY, FULL_AND_PIECEWISE}
+# Default: FULL_AND_PIECEWISE (if compilation enabled)
+
+# Capture sizes
+--cudagraph-capture-sizes [int ...]
+# Example: --cudagraph-capture-sizes 1 2 4 8 16 32 64 128
+# Default: Powers of 2 up to max_cudagraph_capture_size
+
+# Max capture size
+--max-cudagraph-capture-size int
+# Default: min(max_num_seqs * 2, 2048)
+
+# Warmup runs
+--cudagraph-num-of-warmups int
+# Default: 0
+
+# LoRA specialization
+--cudagraph-specialize-lora
+# Capture separate graphs for different LoRA counts
+
+# Metrics
+--cudagraph-metrics
+# Enable CUDA graph usage metrics
+```
+
+### 2.8 Python API Configuration
+
+```python
+from vllm import LLM
+from vllm.config import CompilationConfig
+
+compilation_config = CompilationConfig(
+    mode=3,  # VLLM_COMPILE
+    cudagraph_mode="FULL_AND_PIECEWISE",
+    cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32, 64, 128],
+    max_cudagraph_capture_size=128,
+    cudagraph_num_of_warmups=2,
+    cudagraph_specialize_lora=True,
+)
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    compilation_config=compilation_config,
+)
+```
+
+### 2.9 Runtime Dispatching
+
+**CudagraphDispatcher** (v1/cudagraph_dispatcher.py):
+
+```python
+def dispatch(
+    num_tokens: int,
+    uniform_decode: bool = False,
+    has_lora: bool = False,
+    num_active_loras: int = 0,
+) -> tuple[CUDAGraphMode, BatchDescriptor]:
+    """
+    Returns (runtime_mode, batch_descriptor) for execution.
+
+    Priority: FULL > PIECEWISE > NONE
+    """
+
+    # Try FULL mode first
+    if self._has_full_graph(num_tokens, uniform_decode, ...):
+        return (CUDAGraphMode.FULL, desc)
+
+    # Fall back to PIECEWISE
+    if self._has_piecewise_graph(num_tokens, ...):
+        return (CUDAGraphMode.PIECEWISE, desc)
+
+    # Fall back to eager execution
+    return (CUDAGraphMode.NONE, desc)
+```
+
+**Decision Factors:**
+1. Batch descriptor (tokens, requests, uniformity, LoRA)
+2. Available captured graphs
+3. Attention backend compatibility
+4. Valid/invalid mode constraints
+
+### 2.10 Memory Management
+
+**Graph Pool:**
+```python
+# Global graph pool shared across all graphs
+graph_pool = current_platform.get_global_graph_pool()
+set_graph_pool_id(graph_pool)  # Enable NCCL symmetric memory
+
+# Capture with pool
+with torch.cuda.graph(cudagraph, pool=graph_pool, stream=stream):
+    output = self.runnable(*args, **kwargs)
+```
+
+**Benefits:**
+- Prevents memory fragmentation
+- Allows smaller graphs to reuse memory from larger graphs
+- Integrates with NCCL symmetric memory allocation
+
+---
+
+## 3. SGLang CUDA Graphs
+
+### 3.1 Architecture
+
+SGLang implements a **two-tier CUDA graph system**:
+
+```
+CUDA Graph System
+    ├── CudaGraphRunner (Standard)
+    │   └── For decode operations with fixed batch sizes
+    └── PiecewiseCudaGraphRunner (Novel)
+        └── For prefill/extend with variable token counts
+```
+
+**Key Innovation**: Piecewise CUDA graphs with per-shape torch.compile integration.
+
+### 3.2 Core Files
+
+**Location**: `/home/nmiriyal/Documents/UnderstandingVLLM/LatestVLLM/sglang/python/sglang/srt/model_executor/`
+
+```
+cuda_graph_runner.py                    - Standard CUDA graph runner
+piecewise_cuda_graph_runner.py          - Piecewise CUDA graph runner
+cuda_piecewise_backend.py               - Backend for piecewise graphs
+compilation_config.py                   - Compilation configuration
+```
+
+### 3.3 Standard CUDA Graph Runner
+
+**CudaGraphRunner** (cuda_graph_runner.py):
+
+**Purpose**: Capture graphs for fixed batch sizes during decode operations
+
+**Batch Size Generation**:
+```python
+# Normal workload (logarithmic spacing)
+capture_bs = (
+    [1, 2, 4, 8, 12]                    # Powers of 2 + 12
+    + list(range(16, 257, 8))           # 16-256 by 8
+    + list(range(272, 512, 16))         # 272-512 by 16
+    + list(range(512, max_bs + 1, 32))  # 512+ by 32
+)
+
+# Speculative decoding (denser small batches)
+capture_bs = (
+    list(range(1, 9, 1))                # 1-8 every 1
+    + list(range(10, 33, 2))            # 10-32 by 2
+    + list(range(40, 65, 4))            # 40-64 by 4
+    + list(range(72, 257, 8))           # 72-256 by 8
+    + list(range(272, max_bs + 1, 16))  # 272+ by 16
+)
+```
+
+**Capture Process**:
+```python
+def capture(self):
+    # Capture in REVERSE order (large to small)
+    for bs in reversed(self.capture_bs):
+        # Warm up runs
+        for _ in range(2):
+            device.synchronize()
+            tp_group.barrier()
+            run_once()
+
+        # Set graph pool
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(device.graph_pool_handle())
+
+        # Capture graph
+        with device.graph(cuda_graph=graph, pool=pool, stream=stream):
+            output = run_once()
+
+        self.graphs[bs] = graph
+        self.output_buffers[bs] = output
+```
+
+**Why Reverse Order?**
+- Large batches captured first allocate more memory
+- Small batches reuse memory from pool (no new allocation)
+- Reduces overall memory fragmentation
+
+**Replay Process**:
+```python
+def replay(self, forward_batch):
+    # Find nearest captured batch size (round up)
+    index = bisect.bisect_left(self.capture_bs, raw_bs)
+    bs = self.capture_bs[index]
+
+    # Pad batch to captured size
+    self.replay_prepare(forward_batch, bs)
+
+    # Execute graph
+    self.graphs[bs].replay()
+
+    # Slice output to actual batch size
+    return output[:raw_num_token]
+```
+
+### 3.4 Piecewise CUDA Graph Runner
+
+**PiecewiseCudaGraphRunner** (piecewise_cuda_graph_runner.py):
+
+**What Problem Does It Solve?**
+
+Standard CUDA graphs require fixed input shapes. Prefill operations have highly variable token counts (4 to 8192+). Piecewise graphs solve this by:
+1. Capturing graphs for specific token counts
+2. Using torch.compile for per-shape specialization
+3. Combining compilation + CUDA graph capture
+
+**Token Count Generation**:
+```python
+def _generate_piecewise_cuda_graph_tokens(max_tokens):
+    capture_sizes = (
+        list(range(4, 33, 4))            # 4-32 by 4
+        + list(range(48, 257, 16))       # 48-256 by 16
+        + list(range(288, 513, 32))      # 288-512 by 32
+        + list(range(576, 1025, 64))     # 576-1024 by 64
+        + list(range(1280, 4097, 256))   # 1280-4096 by 256
+        + list(range(4608, max_tokens + 1, 512))  # 4608+ by 512
+    )
+    return [s for s in capture_sizes if s <= max_tokens]
+```
+
+**Two-Phase Approach**:
+
+**Phase 1: torch.compile Warmup**
+```python
+def warmup_torch_compile(self, num_tokens: int):
+    # Create batch with specific token count
+    forward_batch = ForwardBatch(num_tokens=num_tokens, ...)
+
+    # Run forward to warm up torch.compile
+    # Compiler specializes for this shape
+    with enable_piecewise_cuda_graph_compile():
+        self.model_runner.forward(forward_batch)
+```
+
+**Phase 2: CUDA Graph Capture**
+```python
+def capture(self):
+    for num_tokens in reversed(self.capture_num_tokens):
+        forward_batch = ForwardBatch(num_tokens=num_tokens, ...)
+
+        # First run: warm up compiled graph
+        self.model_runner.forward(forward_batch)
+
+        # Second run: capture to CUDA graph
+        with torch.cuda.graph(graph, pool=pool):
+            output = self.model_runner.forward(forward_batch)
+
+        self.graphs[num_tokens] = graph
+        self.outputs[num_tokens] = output
+```
+
+**Execution Flow**:
+```
+Request with N tokens
+    ↓
+Find nearest captured token count (round up)
+    ↓
+First execution: torch.compile specialization
+    ↓
+Subsequent executions: CUDA graph replay
+    ↓
+Output sliced to actual token count
+```
+
+### 3.5 Piecewise Backend
+
+**ConcreteSizeEntry** (cuda_piecewise_backend.py):
+
+Tracks per-shape compilation and graph state:
+
+```python
+@dataclass
+class ConcreteSizeEntry:
+    runtime_shape: int
+    need_to_compile: bool       # Should use torch.compile?
+    use_cudagraph: bool         # Should capture CUDA graph?
+
+    compiled: bool = False
+    runnable: Callable = None
+    cudagraph: Optional[CUDAGraph] = None
+    output: Optional[Any] = None
+    num_finished_warmup: int = 0
+```
+
+**Execution Algorithm**:
+
+```python
+def __call__(self, graph_module, args):
+    runtime_shape = self._get_runtime_shape(args)
+    entry = self.entries[runtime_shape]
+
+    # Step 1: Compile on first run
+    if entry.need_to_compile and not entry.compiled:
+        entry.compiled = True
+        entry.runnable = compiler_manager.compile(
+            graph_module, args, config,
+            runtime_shape=runtime_shape
+        )
+
+    # Step 2: CUDA graph capture on second run
+    if entry.use_cudagraph and entry.cudagraph is None:
+        if entry.num_finished_warmup < 1:
+            # First warm run
+            entry.num_finished_warmup += 1
+            return entry.runnable(*args)
+
+        # Second run: capture
+        cudagraph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cudagraph, pool=pool):
+            output = entry.runnable(*args)
+            output = weak_ref_tensors(output)
+
+        entry.cudagraph = cudagraph
+        entry.output = output
+
+    # Step 3: Replay or execute
+    if entry.cudagraph:
+        entry.cudagraph.replay()
+        return entry.output
+    else:
+        return entry.runnable(*args)
+```
+
+### 3.6 Unique Features
+
+#### A. Hidden State Capture Modes
+
+```python
+class CaptureHiddenMode(Enum):
+    NULL = 0    # Don't capture hidden states
+    LAST = 1    # Capture last token's hidden state
+    FULL = 2    # Capture all tokens' hidden states
+```
+
+**Dynamic Recapture**:
+```python
+def recapture_if_needed(self, forward_batch):
+    # Determine required mode from batch requirements
+    required_mode = max(
+        forward_batch.required_mode,
+        spec_info.required_mode,
+        enable_return_hidden_states,
+    )
+
+    # Recapture if mode increased
+    if self.capture_hidden_mode != required_mode:
+        self.capture_hidden_mode = required_mode
+        self.capture()  # Re-capture all graphs
+```
+
+#### B. Graph Input Buffers
+
+Pre-allocated static buffers ensure fixed memory addresses:
+
+```python
+class GraphInputBuffers:
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    out_cache_loc: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    mrope_positions: torch.Tensor
+    next_token_logits_buffer: torch.Tensor
+    # ... and more for mamba, encoder-decoder, etc.
+```
+
+#### C. Memory Saver Adapter
+
+Optional memory optimization during capture:
+
+```python
+if enable_memory_saver:
+    with MemorySaverAdapter():
+        with device.graph(graph, pool=pool):
+            output = run_once()
+```
+
+### 3.7 Command-Line Options
+
+```bash
+# Standard CUDA Graphs
+--cuda-graph-max-bs int
+    # Maximum batch size for CUDA graph capture
+    # Default: Scheduler's max batch size
+
+--cuda-graph-bs [int ...]
+    # Explicit list of batch sizes to capture
+    # Example: --cuda-graph-bs 1 2 4 8 16 32
+
+--disable-cuda-graph
+    # Completely disable CUDA graphs
+
+--disable-cuda-graph-padding
+    # Capture only requested batch sizes (no padding)
+    # Captures all sizes from 1 to max_bs
+
+--enable-profile-cuda-graph
+    # Profile CUDA graph capture and replay
+
+--enable-cudagraph-gc
+    # Enable garbage collection during capture (slower but safer)
+
+# Piecewise CUDA Graphs
+--enable-piecewise-cuda-graph
+    # Enable piecewise CUDA graphs for prefill/extend
+
+--piecewise-cuda-graph-max-tokens int
+    # Maximum tokens for piecewise graphs
+    # Default: 2048-4096 depending on model
+
+--piecewise-cuda-graph-tokens [int ...]
+    # Explicit token counts to capture
+    # Example: --piecewise-cuda-graph-tokens 4 16 64 256
+
+--piecewise-cuda-graph-compiler {eager, inductor}
+    # Compiler for piecewise graphs
+    # eager: Direct torch execution
+    # inductor: torch.compile with inductor backend
+
+# torch.compile Integration
+--enable-torch-compile
+    # Use torch.compile with CUDA graphs
+
+--torch-compile-max-bs int
+    # Max batch size for torch.compile
+```
+
+### 3.8 Python API Configuration
+
+```python
+import sglang as sgl
+
+runtime = sgl.Runtime(
+    model_path="meta-llama/Llama-3.1-8B-Instruct",
+
+    # Standard CUDA graphs
+    cuda_graph_max_bs=128,
+    disable_cuda_graph=False,
+
+    # Piecewise CUDA graphs
+    enable_piecewise_cuda_graph=True,
+    piecewise_cuda_graph_max_tokens=4096,
+    piecewise_cuda_graph_compiler="eager",
+
+    # torch.compile
+    enable_torch_compile=True,
+)
+```
+
+### 3.9 Selection Logic
+
+**Model Runner Selection** (model_runner.py):
+
+```python
+def forward(self, forward_batch):
+    # Priority 1: Try piecewise CUDA graphs (for extend/prefill)
+    if (self.piecewise_cuda_graph_runner
+        and self.piecewise_cuda_graph_runner.can_run(forward_batch)):
+        return self.piecewise_cuda_graph_runner.replay(forward_batch)
+
+    # Priority 2: Try standard CUDA graphs (for decode)
+    if (self.graph_runner
+        and self.graph_runner.can_run(forward_batch)):
+        return self.graph_runner.replay(forward_batch)
+
+    # Fallback: Eager execution
+    return self.model.forward(forward_batch)
+```
+
+**Can Run Criteria**:
+- **Standard**: Decode-only batch, batch size in captured sizes
+- **Piecewise**: Extend/prefill batch, token count in captured sizes
+
+---
+
+## 4. TensorRT-LLM CUDA Graphs
+
+### 4.1 Architecture
+
+TensorRT-LLM integrates CUDA graphs at **multiple levels**:
+
+```
+TensorRT Runtime
+    ├── Automatic graph capture in C++ runtime
+    ├── Python CUDAGraphRunner for batch padding
+    └── PyTorch CapturedGraph for torch models
+```
+
+**Key Feature**: TensorRT can automatically use CUDA graphs when enabled, with minimal configuration.
+
+### 4.2 Core Files
+
+**Location**: `/home/nmiriyal/Documents/UnderstandingVLLM/LatestVLLM/TensorRT-LLM/`
+
+```
+tensorrt_llm/runtime/generation.py                       - C++ interop
+tensorrt_llm/llmapi/llm_args.py                          - Python config
+tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py      - CUDAGraphRunner
+tensorrt_llm/_torch/pyexecutor/torch_cudagraph.py        - CapturedGraph
+cpp/tensorrt_llm/batch_manager/utils/inflightBatchingUtils.h  - C++ executor
+```
+
+### 4.3 TensorRT Runtime CUDA Graphs
+
+**Automatic Capture** (runtime/generation.py):
+
+TensorRT runtime can automatically capture and replay CUDA graphs:
+
+```python
+# Configuration
+config = ExtendedRuntimePerfKnobConfig(
+    cuda_graph_mode=True,           # Enable CUDA graphs
+    cuda_graph_cache_size=10,       # LRU cache size
+)
+
+# Capture phase (automatic during first execution)
+CUASSERT(cudart.cudaStreamBeginCapture(
+    stream,
+    cudart.cudaStreamCaptureMode.cudaStreamCaptureModeGlobal
+))
+context.execute_async_v3(stream)  # TensorRT engine execution
+next_graph = CUASSERT(cudart.cudaStreamEndCapture(stream))[0]
+
+# Instantiate graph
+self.cuda_graph_instances[idx] = CUASSERT(
+    cudart.cudaGraphInstantiate(next_graph, 0)
+)[0]
+
+# Upload to stream
+CUASSERT(cudart.cudaGraphUpload(self.cuda_graph_instances[idx], stream))
+
+# Replay phase (subsequent executions)
+CUASSERT(cudart.cudaGraphLaunch(self.cuda_graph_instances[idx], stream))
+```
+
+**Ping-Pong Buffering**:
+- Maintains two graph instances for smooth overlap
+- While one graph executes, another can be captured/updated
+- Prevents pipeline stalls
+
+### 4.4 Python CUDA Graph Configuration
+
+**CudaGraphConfig** (llmapi/llm_args.py):
+
+```python
+class CudaGraphConfig(StrictBaseModel):
+    batch_sizes: Optional[List[int]] = None
+        # Specific batch sizes to capture
+        # If None, auto-generated
+
+    max_batch_size: int = 0
+        # Maximum batch size for graphs
+
+    enable_padding: bool = False
+        # Pad batches to nearest graph size
+```
+
+**Batch Size Generation**:
+
+```python
+def _generate_cuda_graph_batch_sizes(max_batch_size, enable_padding):
+    if enable_padding:
+        # More granular for padding
+        batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+    else:
+        # Sparser without padding
+        batch_sizes = list(range(1, 32)) + [32, 64, 128]
+
+    return [bs for bs in batch_sizes if bs <= max_batch_size]
+```
+
+**Usage Example**:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import CudaGraphConfig
+
+cuda_graph_config = CudaGraphConfig(
+    batch_sizes=[1, 2, 4, 8, 16, 32],
+    max_batch_size=32,
+    enable_padding=True,
+)
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    cuda_graph_config=cuda_graph_config,
+)
+```
+
+### 4.5 CUDAGraphRunner
+
+**Purpose**: Manage CUDA graph lifecycle for decoding batches
+
+**Architecture**:
+
+```python
+class CUDAGraphRunner:
+    def __init__(self, config: CUDAGraphRunnerConfig):
+        self.use_cuda_graph = config.use_cuda_graph
+        self.padding_enabled = config.cuda_graph_padding_enabled
+        self.batch_sizes = config.cuda_graph_batch_sizes
+        self.memory_pool = config.cuda_graph_mem_pool
+
+        self.graphs: Dict[KeyType, torch.cuda.CUDAGraph] = {}
+        self._input_buffers: Dict[KeyType, Dict] = {}
+        self._output_buffers: Dict[KeyType, Any] = {}
+```
+
+**Three Core Operations**:
+
+**1. Eligibility Check**:
+```python
+def maybe_get_cuda_graph(self, batch_size, is_decode_only):
+    # Only decode batches supported
+    if not is_decode_only:
+        return None
+
+    # Check if batch size supported
+    if batch_size not in self.batch_sizes:
+        if self.padding_enabled:
+            # Round up to nearest size
+            batch_size = next(bs for bs in self.batch_sizes if bs >= batch_size)
+        else:
+            return None
+
+    return batch_size
+```
+
+**2. Batch Padding**:
+```python
+@contextmanager
+def pad_batch(self, batch, target_bs):
+    """Add dummy requests to reach target batch size"""
+    original_bs = len(batch)
+
+    # Add dummy requests
+    for _ in range(target_bs - original_bs):
+        batch.add_dummy_request()
+
+    yield batch
+
+    # Remove dummy requests
+    batch.remove_dummy_requests(original_bs)
+```
+
+**3. Capture and Replay**:
+```python
+def capture(self, key, forward_fn, initial_inputs):
+    # Allocate static buffers
+    self._input_buffers[key] = self._allocate_buffers(initial_inputs)
+
+    # Capture graph
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=self.memory_pool):
+        output = forward_fn(self._input_buffers[key])
+
+    self.graphs[key] = graph
+    self._output_buffers[key] = output
+
+def replay(self, key, current_inputs):
+    # Copy current inputs to static buffers
+    self._copy_inputs(current_inputs, self._input_buffers[key])
+
+    # Replay graph
+    self.graphs[key].replay()
+
+    return self._output_buffers[key]
+```
+
+### 4.6 PyTorch CapturedGraph
+
+**CapturedGraph** (torch_cudagraph.py):
+
+For PyTorch models (not TensorRT engines):
+
+```python
+class CapturedGraph(nn.Module):
+    def __init__(self, model, num_batched_inputs=None):
+        self.model = model
+        self.cudagraphs: Dict[Tuple[int, ...], CUDAGraph] = {}
+        self._cuda_graph_mem_pool = None
+
+    def capture_graph(self, get_args_kwargs_fn, batch_sizes):
+        """Capture graphs for specified batch sizes"""
+        for bs in batch_sizes:
+            args, kwargs = get_args_kwargs_fn(bs)
+
+            # Get combined shape key
+            combined_shape = self._get_shape_key(args, kwargs)
+
+            # Capture graph
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
+                out = self.model(*args, **kwargs)
+
+            self.cudagraphs[combined_shape] = graph
+
+    def forward(self, *args, **kwargs):
+        combined_shape = self._get_shape_key(args, kwargs)
+
+        if combined_shape in self.cudagraphs:
+            # Replay graph
+            self.cudagraphs[combined_shape].replay()
+            return self._output_cache[combined_shape]
+        else:
+            # Fallback to eager execution
+            return self.model(*args, **kwargs)
+```
+
+### 4.7 C++ CUDA Graph Executor
+
+**CudaGraphExecutor** (cpp/batch_manager/utils/inflightBatchingUtils.h):
+
+```cpp
+class CudaGraphExecutor {
+public:
+    bool hasInstance() const { return mInstance != nullptr; }
+
+    void prepareNextGraph(
+        std::unique_ptr<runtime::TllmRuntime>& runtime,
+        SizeType32 nextContextId
+    );
+
+    void launch(runtime::CudaStream const& stream) {
+        CUASSERT(cudaGraphLaunch(mInstance, stream.get()));
+    }
+
+    void clear() {
+        if (mInstance) {
+            CUASSERT(cudaGraphExecDestroy(mInstance));
+            mInstance = nullptr;
+        }
+    }
+
+private:
+    void create(cudaGraph_t const& graph);
+    bool update(cudaGraph_t const& graph);
+    void uploadToStream(runtime::CudaStream const& stream);
+
+    cudaGraphExec_t mInstance;  // Instantiated graph
+};
+```
+
+**CudaGraphExecutorCache**:
+- LRU cache for multiple graph instances
+- Maps batch configurations to executors
+- Configurable cache size for memory management
+
+### 4.8 Command-Line Options
+
+TensorRT-LLM uses Python API configuration (no direct CLI):
+
+```python
+# Via CudaGraphConfig
+cuda_graph_config = CudaGraphConfig(
+    batch_sizes=[1, 2, 4, 8, 16, 32, 64],
+    max_batch_size=64,
+    enable_padding=True,
+)
+
+# Via ExtendedRuntimePerfKnobConfig (C++ runtime)
+runtime_config = ExtendedRuntimePerfKnobConfig(
+    cuda_graph_mode=True,
+    cuda_graph_cache_size=10,
+)
+```
+
+### 4.9 Key Limitations
+
+**Decode-Only Restriction**:
+- CUDA graphs only used for pure decode batches
+- Prefill has variable sequence lengths → not graph-compatible
+- Mixed batches fall back to eager execution
+
+**Why This Design?**
+- Prefill: Highly variable token counts (1-8192+)
+- Decode: Fixed 1 token per request → uniform shape
+- Capturing separate graphs for each prefill length impractical
+
+**Batch Padding Trade-off**:
+- With padding: More memory but fewer graphs
+- Without padding: More graphs but precise batch matching
+- Configuration option allows user choice
+
+### 4.10 TensorRT vs CUDA Graphs
+
+**TensorRT Graph Optimization** (build time):
+- Layer fusion, kernel selection, precision calibration
+- Creates optimized computation graph
+- Offline optimization during engine building
+
+**CUDA Graphs** (runtime):
+- Captures exact sequence of CUDA operations
+- Reduces CPU overhead by replaying command stream
+- Works on top of TensorRT's optimized execution
+
+**Relationship**:
+- TensorRT optimizes WHAT kernels run
+- CUDA graphs optimize HOW those kernels are launched
+- Complementary optimizations for maximum performance
+
+---
+
+## 5. Algorithmic Differences
+
+### 5.1 Capture Strategy
+
+| System | Strategy | Order | Pool Management |
+|--------|----------|-------|-----------------|
+| **vLLM** | On-demand capture during warmup | PIECEWISE first, then FULL | Global graph pool |
+| **SGLang** | Batch capture at initialization | Reverse order (large→small) | Global pool + symmetric memory |
+| **TensorRT-LLM** | Automatic on first execution | On-demand per batch config | Per-graph pool or shared |
+
+### 5.2 Batch Matching
+
+| System | Matching Algorithm | Padding | Fallback |
+|--------|-------------------|---------|----------|
+| **vLLM** | Exact match on BatchDescriptor | No padding | CUDAGraphMode.NONE |
+| **SGLang** | Binary search + round up | Yes (to next captured size) | Eager execution |
+| **TensorRT-LLM** | Exact match or round up | Optional (configurable) | Eager execution |
+
+### 5.3 Mode Selection
+
+| System | Modes | Dispatch Logic |
+|--------|-------|----------------|
+| **vLLM** | NONE, PIECEWISE, FULL, Dual-mode | Priority: FULL > PIECEWISE > NONE |
+| **SGLang** | Standard, Piecewise | Priority: Piecewise > Standard > Eager |
+| **TensorRT-LLM** | Decode-only | Decode check → Graph or Eager |
+
+### 5.4 Memory Optimization
+
+| Technique | vLLM | SGLang | TensorRT-LLM |
+|-----------|------|--------|--------------|
+| **Weak Reference Outputs** | ✅ | ✅ | ❌ |
+| **Reverse Capture Order** | ❌ | ✅ | ❌ |
+| **Graph Pool Sharing** | ✅ | ✅ | ⚠️ (configurable) |
+| **Memory Saver Adapter** | ❌ | ✅ | ❌ |
+| **Symmetric Memory (NCCL)** | ❌ | ✅ | ❌ |
+
+### 5.5 Variable Shape Handling
+
+| System | Approach | Token Counts | Compilation |
+|--------|----------|--------------|-------------|
+| **vLLM** | PIECEWISE mode excludes attention | Fixed per capture | Optional (inductor) |
+| **SGLang** | Piecewise graphs + torch.compile | ~20-50 sizes | Per-shape compile + graph |
+| **TensorRT-LLM** | Decode-only restriction | N/A | TensorRT build-time |
+
+### 5.6 Warmup Procedure
+
+**vLLM**:
+```python
+# Warmup in NONE mode, then capture in target mode
+for _ in range(num_warmups):
+    _dummy_run(cudagraph_runtime_mode=NONE)
+_dummy_run(cudagraph_runtime_mode=target_mode, is_graph_capturing=True)
+```
+
+**SGLang**:
+```python
+# Two warm runs, then capture
+for _ in range(2):
+    run_once()
+with device.graph(graph):
+    output = run_once()
+```
+
+**TensorRT-LLM**:
+```python
+# Automatic on first execution (no explicit warmup)
+# Graph captured transparently if cuda_graph_mode=True
+```
+
+---
+
+## 6. Command-Line Options Comparison
+
+### 6.1 vLLM Options
+
+```bash
+# Mode selection
+--cudagraph-mode {NONE, PIECEWISE, FULL, FULL_DECODE_ONLY, FULL_AND_PIECEWISE}
+
+# Capture configuration
+--cudagraph-capture-sizes [int ...]
+--max-cudagraph-capture-size int
+--cudagraph-num-of-warmups int
+
+# Specialization
+--cudagraph-specialize-lora
+
+# Monitoring
+--cudagraph-metrics
+```
+
+**Example**:
+```bash
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --cudagraph-mode FULL_AND_PIECEWISE \
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64 128 \
+    --max-cudagraph-capture-size 128 \
+    --cudagraph-num-of-warmups 2 \
+    --cudagraph-metrics
+```
+
+### 6.2 SGLang Options
+
+```bash
+# Standard graphs
+--cuda-graph-max-bs int
+--cuda-graph-bs [int ...]
+--disable-cuda-graph
+--disable-cuda-graph-padding
+
+# Piecewise graphs
+--enable-piecewise-cuda-graph
+--piecewise-cuda-graph-max-tokens int
+--piecewise-cuda-graph-tokens [int ...]
+--piecewise-cuda-graph-compiler {eager, inductor}
+
+# torch.compile
+--enable-torch-compile
+--torch-compile-max-bs int
+
+# Profiling
+--enable-profile-cuda-graph
+--enable-cudagraph-gc
+```
+
+**Example**:
+```bash
+python -m sglang.launch_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --cuda-graph-max-bs 128 \
+    --enable-piecewise-cuda-graph \
+    --piecewise-cuda-graph-max-tokens 4096 \
+    --piecewise-cuda-graph-compiler eager \
+    --enable-torch-compile
+```
+
+### 6.3 TensorRT-LLM Options
+
+TensorRT-LLM uses Python API configuration:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import CudaGraphConfig
+
+cuda_graph_config = CudaGraphConfig(
+    batch_sizes=[1, 2, 4, 8, 16, 32, 64],
+    max_batch_size=64,
+    enable_padding=True,
+)
+
+llm = LLM(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    cuda_graph_config=cuda_graph_config,
+)
+```
+
+**No CLI equivalent** - configuration must be done in Python code.
+
+---
+
+## 7. Performance Trade-offs
+
+### 7.1 Memory vs Coverage
+
+**vLLM**:
+- **Memory**: Moderate (dual-mode captures both FULL and PIECEWISE)
+- **Coverage**: Excellent (handles prefill and decode)
+- **Flexibility**: High (automatic mode downgrade)
+
+**SGLang**:
+- **Memory**: Higher (two-tier system + per-shape compilation)
+- **Coverage**: Excellent (standard + piecewise covers all cases)
+- **Flexibility**: Very high (torch.compile + graphs)
+
+**TensorRT-LLM**:
+- **Memory**: Lower (decode-only)
+- **Coverage**: Limited (decode batches only)
+- **Flexibility**: Low (fixed decode-only strategy)
+
+### 7.2 Warmup Time
+
+| System | Warmup Overhead | Reason |
+|--------|----------------|---------|
+| **vLLM** | Low-Medium | Configurable warmups (default 0-2) |
+| **SGLang** | Medium-High | Two-tier capture + torch.compile |
+| **TensorRT-LLM** | Low | Automatic on first execution |
+
+### 7.3 Runtime Performance
+
+**CPU Overhead Reduction**:
+- **vLLM**: ~10-30% improvement with FULL mode
+- **SGLang**: ~15-40% improvement (more with piecewise)
+- **TensorRT-LLM**: ~20-50% improvement (TensorRT optimization + graphs)
+
+**Latency Improvement**:
+- **vLLM**: Better for decode-heavy workloads
+- **SGLang**: Better for mixed prefill/decode workloads
+- **TensorRT-LLM**: Best for pure decode workloads
+
+### 7.4 Flexibility vs Performance
+
+**vLLM**:
+- ✅ Automatic mode selection
+- ✅ Attention backend compatibility
+- ✅ LoRA specialization
+- ⚠️ Requires warmup configuration
+
+**SGLang**:
+- ✅ Handles variable prefill lengths
+- ✅ torch.compile integration
+- ✅ Hidden state capture modes
+- ⚠️ Higher memory overhead
+- ⚠️ Complex configuration
+
+**TensorRT-LLM**:
+- ✅ Automatic capture
+- ✅ Minimal configuration
+- ✅ TensorRT optimization
+- ❌ Decode-only limitation
+- ❌ No prefill graph support
+
+---
+
+## 8. Best Practices
+
+### 8.1 When to Use Each System
+
+**vLLM**:
+- General-purpose LLM serving
+- Mixed workloads (chat, completion, etc.)
+- Need LoRA adapter support
+- Want automatic mode selection
+
+**SGLang**:
+- Heavy prefix caching workloads
+- Long prefill sequences (>1K tokens)
+- Need maximum flexibility
+- Can tolerate higher memory usage
+
+**TensorRT-LLM**:
+- Decode-heavy workloads
+- Maximum single-request performance
+- NVIDIA hardware optimization
+- Production deployment
+
+### 8.2 Configuration Recommendations
+
+**vLLM**:
+```python
+# Recommended for production
+compilation_config = CompilationConfig(
+    cudagraph_mode="FULL_AND_PIECEWISE",  # Best balance
+    cudagraph_capture_sizes=[1, 2, 4, 8, 16, 32, 64, 128],
+    max_cudagraph_capture_size=128,
+    cudagraph_num_of_warmups=2,  # Ensure stable capture
+)
+```
+
+**SGLang**:
+```python
+# Recommended for chat workloads
+runtime = sgl.Runtime(
+    cuda_graph_max_bs=128,
+    enable_piecewise_cuda_graph=True,  # For long prompts
+    piecewise_cuda_graph_max_tokens=4096,
+    enable_torch_compile=True,  # Extra optimization
+)
+```
+
+**TensorRT-LLM**:
+```python
+# Recommended for decode-heavy
+cuda_graph_config = CudaGraphConfig(
+    max_batch_size=64,
+    enable_padding=True,  # Reduce graph count
+)
+```
+
+### 8.3 Debugging Tips
+
+**vLLM**:
+```bash
+# Disable graphs for debugging
+--cudagraph-mode NONE
+
+# Enable metrics to see graph usage
+--cudagraph-metrics
+```
+
+**SGLang**:
+```bash
+# Disable graphs
+--disable-cuda-graph
+
+# Profile graph capture
+--enable-profile-cuda-graph
+
+# Enable GC during capture (safer but slower)
+--enable-cudagraph-gc
+```
+
+**TensorRT-LLM**:
+```python
+# Disable graphs
+cuda_graph_config = CudaGraphConfig(
+    batch_sizes=[],  # Empty list disables
+)
+```
+
+### 8.4 Memory Optimization
+
+**vLLM**:
+- Use `FULL_DECODE_ONLY` for decode-only workloads (saves memory)
+- Reduce `max_cudagraph_capture_size` if memory constrained
+- Disable LoRA specialization if not needed
+
+**SGLang**:
+- Reduce `piecewise_cuda_graph_max_tokens` for smaller models
+- Use `--disable-cuda-graph-padding` to capture fewer sizes
+- Disable piecewise graphs if prefill is short
+
+**TensorRT-LLM**:
+- Set smaller `cuda_graph_cache_size` to reduce LRU cache
+- Use `enable_padding=True` to reduce total graph count
+- Reduce `max_batch_size` if memory limited
+
+---
+
+## 9. Summary
+
+### 9.1 Feature Matrix
+
+| Feature | vLLM | SGLang | TensorRT-LLM |
+|---------|------|--------|--------------|
+| **Prefill Support** | ✅ (PIECEWISE) | ✅ (Piecewise graphs) | ❌ |
+| **Decode Support** | ✅ (FULL) | ✅ (Standard graphs) | ✅ |
+| **Variable Shapes** | ⚠️ (via PIECEWISE) | ✅ (torch.compile + graphs) | ❌ |
+| **Automatic Mode Selection** | ✅ | ⚠️ (priority-based) | ⚠️ (decode-only) |
+| **Batch Padding** | ❌ | ✅ | ✅ (optional) |
+| **LoRA Support** | ✅ | ⚠️ (limited) | ⚠️ (limited) |
+| **torch.compile Integration** | ⚠️ (via compilation) | ✅ (deep integration) | ❌ |
+| **Memory Efficiency** | Medium | Lower | Higher |
+| **Configuration Complexity** | Medium | High | Low |
+| **Warmup Overhead** | Low-Medium | Medium-High | Low |
+| **Runtime Flexibility** | High | Very High | Low |
+
+### 9.2 Key Innovations
+
+**vLLM**:
+- ✨ **Dual-mode system**: FULL_AND_PIECEWISE for optimal coverage
+- ✨ **Dispatcher architecture**: Intelligent runtime mode selection
+- ✨ **Attention backend aware**: Automatic mode downgrade
+
+**SGLang**:
+- ✨ **Piecewise CUDA graphs**: Variable prefill length support
+- ✨ **Per-shape compilation**: torch.compile + CUDA graph synergy
+- ✨ **Hidden state modes**: Dynamic recapture based on requirements
+
+**TensorRT-LLM**:
+- ✨ **Automatic capture**: Transparent graph usage
+- ✨ **Ping-pong buffering**: Smooth graph overlap
+- ✨ **TensorRT integration**: Build-time + runtime optimization
+
+### 9.3 Recommendations
+
+**Choose vLLM if**:
+- Need general-purpose serving
+- Want automatic optimization
+- Support for multiple attention backends
+- LoRA adapter serving
+
+**Choose SGLang if**:
+- Heavy prefix caching workloads
+- Long prefill sequences
+- Maximum flexibility required
+- Can invest in configuration tuning
+
+**Choose TensorRT-LLM if**:
+- Decode-heavy workloads
+- Maximum performance on NVIDIA GPUs
+- Production deployment with TensorRT
+- Minimal configuration preferred
+
+All three systems demonstrate sophisticated CUDA graph implementations with different trade-offs optimized for their target use cases.
